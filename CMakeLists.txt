@@ -7,7 +7,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
 
-add_executable(chat_app src/host.cpp)
+add_executable(chat_app
+         src/host.cpp
+         src/ui/chat_window.cpp)
 
 target_compile_options(chat_app PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(chat_app PRIVATE Qt6::Widgets)
