@@ -17,7 +17,9 @@ public:
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
 
-    void selectSide(bool isHost);
+    // Вызывается в каждом процессе после fork(), до создания окна.
+    virtual void selectSide(bool isHost);
+
     void send(std::string_view text) const;
     void listen(QObject* context, Handler onMessage, Handler onEnd);
     void close();
@@ -41,5 +43,4 @@ private:
     std::string buffer_;
 };
 
-// При сборке каждой программы выбирается одна реализация этой функции.
 std::unique_ptr<Connection> openConnection();

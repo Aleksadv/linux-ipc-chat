@@ -145,8 +145,8 @@ int main(int argc, char* argv[])
 
     try {
         auto connection = openConnection();
-
         pid_t child = fork();
+
         if (child == -1) {
             std::perror("fork");
             return 1;
@@ -162,7 +162,19 @@ int main(int argc, char* argv[])
             }
         }
 
-        const int code = runWindow(argc, argv, child, *connection);
+        int code = 1;
+
+        try {
+            code = runWindow(argc, argv, child, *connection);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "host: %s\n", e.what());
+
+            // При ошибке запуска ребёнок может ещё ждать готовности хоста.
+            if (child > 0 && kill(child, SIGKILL) == -1 && errno != ESRCH) {
+                std::perror("kill");
+            }
+        }
+
         connection->close();
 
         if (child > 0) {
