@@ -1,4 +1,4 @@
-#include "ipc/conn_pipe.hpp"
+#include "ipc/connection.hpp"
 #include "ui/chat_window.hpp"
 
 #include <QApplication>
@@ -13,7 +13,6 @@
 
 namespace {
 
-// Только родитель проверяет и собирает статус своего ребёнка.
 bool stillRunning(pid_t& child)
 {
     if (child <= 0) {
@@ -37,13 +36,10 @@ bool stillRunning(pid_t& child)
     return false;
 }
 
-int runWindow(int& argc, char** argv, pid_t& child,
-              PipeChannel& incoming, PipeChannel& outgoing)
+int runWindow(int& argc, char** argv, pid_t& child, Connection& connection)
 {
     const bool isHost = child > 0;
-
-    incoming.closeWriter();
-    outgoing.closeReader();
+    connection.selectSide(isHost);
 
     QApplication app(argc, argv);
 
@@ -53,7 +49,6 @@ int runWindow(int& argc, char** argv, pid_t& child,
                                 : QStringLiteral("Хост");
 
     ChatWindow window(name);
-
     QElapsedTimer idle;
     QTimer watchdog;
     bool awaitingHello = isHost;
@@ -84,11 +79,10 @@ int runWindow(int& argc, char** argv, pid_t& child,
         watchdog.start(250);
     }
 
-    incoming.listen(
+    connection.listen(
         &window,
         [&](const std::string& bytes) {
             if (awaitingHello) {
-                // Первым кадром клиент всегда присылает приветствие.
                 awaitingHello = false;
                 window.appendLine(QString::fromStdString(bytes));
                 return;
@@ -98,8 +92,9 @@ int runWindow(int& argc, char** argv, pid_t& child,
                 idle.restart();
             }
 
-            window.appendLine(peer + QStringLiteral(": ")
-                              + QString::fromStdString(bytes));
+            window.appendLine(
+                peer + QStringLiteral(": ") + QString::fromStdString(bytes)
+            );
         },
         [&](const std::string& error) {
             window.stopSending();
@@ -107,11 +102,9 @@ int runWindow(int& argc, char** argv, pid_t& child,
             if (!error.empty()) {
                 window.appendLine(QString::fromStdString(error));
             }
-
             if (!killSent) {
                 window.appendLine(peer + QStringLiteral(" отключился"));
             }
-
             if (!isHost) {
                 app.quit();
             }
@@ -122,17 +115,18 @@ int runWindow(int& argc, char** argv, pid_t& child,
         &window, &ChatWindow::sendRequested, &window,
         [&](const QString& text) {
             try {
-                outgoing.send(text.toStdString());
+                connection.send(text.toStdString());
                 window.confirmSend(text);
             } catch (const std::exception& e) {
-                window.appendLine(QStringLiteral("Не отправлено: ")
-                                  + QString::fromUtf8(e.what()));
+                window.appendLine(
+                    QStringLiteral("Не отправлено: ") + QString::fromUtf8(e.what())
+                );
             }
         }
     );
 
     if (!isHost) {
-        outgoing.send("Клиент подключился");
+        connection.send("Клиент подключился");
     }
 
     window.show();
@@ -150,11 +144,9 @@ int main(int argc, char* argv[])
     }
 
     try {
-        PipeChannel toHost;
-        PipeChannel toClient;
+        auto connection = openConnection();
 
         pid_t child = fork();
-
         if (child == -1) {
             std::perror("fork");
             return 1;
@@ -162,7 +154,7 @@ int main(int argc, char* argv[])
 
         if (child == 0) {
             try {
-                const int code = runWindow(argc, argv, child, toClient, toHost);
+                const int code = runWindow(argc, argv, child, *connection);
                 _exit(code);
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "client: %s\n", e.what());
@@ -170,11 +162,8 @@ int main(int argc, char* argv[])
             }
         }
 
-        const int code = runWindow(argc, argv, child, toHost, toClient);
-
-        // Если пользователь закрыл хоста, клиент получит EOF.
-        toClient.closeWriter();
-        toHost.closeReader();
+        const int code = runWindow(argc, argv, child, *connection);
+        connection->close();
 
         if (child > 0) {
             while (waitpid(child, nullptr, 0) == -1) {
