@@ -12,9 +12,8 @@ class ChatWindow : public QWidget {
 
 public:
     explicit ChatWindow(const QString& participantName, QWidget* parent = nullptr);
-
     void appendLine(const QString& line);
-    void confirmSend(const QString& text);
+    void clearInput();
     void stopSending();
 
 signals:
@@ -22,7 +21,6 @@ signals:
 
 private:
     void sendMessage();
-
     QString participantName_;
     QListWidget* history_;
     QLineEdit* input_;

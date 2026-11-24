@@ -1,116 +1,76 @@
-#include "ipc/connection.hpp"
-#include "runtime/client_reader.hpp"
-#include "ui/chat_window.hpp"
+#include "runtime/sessions.hpp"
 
-#include <QApplication>
-#include <QElapsedTimer>
-#include <QTimer>
 #include <cerrno>
+#include <charconv>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
-#include <exception>
+#include <stdexcept>
+#include <string_view>
+#include <system_error>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 
 namespace {
 
-// Только родитель вызывает эту функцию. После сбора статуса PID забываем.
-bool stillRunning(pid_t& child)
+int clientCount(int argc, char** argv)
 {
-    if (child <= 0) return false;
-    pid_t result;
-    do {
-        result = waitpid(child, nullptr, WNOHANG);
-    } while (result == -1 && errno == EINTR);
-    if (result == 0) return true;
-    if (result == -1 && errno != ECHILD) std::perror("waitpid");
-    child = -1;
-    return false;
+    if (argc == 1) return 1;
+    int count = 0;
+    if (argc == 3 && std::string_view(argv[1]) == "--clients") {
+        std::string_view value(argv[2]);
+        auto end = value.data() + value.size();
+        auto parsed = std::from_chars(value.data(), end, count);
+        if (parsed.ec == std::errc{} && parsed.ptr == end && count > 0) return count;
+    }
+    throw std::invalid_argument("Запуск: host_<транспорт> [--clients N], N >= 1");
 }
 
-int runWindow(int& argc, char** argv, pid_t& child,
-              Connection& connection)
+void finish(Sessions& sessions)
 {
-    const bool isHost = child > 0;
-    connection.selectSide(isHost);
-    QApplication app(argc, argv);
-    const QString name = isHost ? QStringLiteral("Хост") : QStringLiteral("Клиент 1");
-    const QString peer = isHost ? QStringLiteral("Клиент 1") : QStringLiteral("Хост");
-    ChatWindow window(name);
+    for (auto& s : sessions) s->channel->close();
 
-    QElapsedTimer idle;
-    QTimer watchdog;
-    bool awaitingHello = isHost;
-    bool killSent = false;
-    if (isHost) {
-        idle.start();
-        QObject::connect(&watchdog, &QTimer::timeout, &window, [&] {
-            if (!stillRunning(child)) {
-                watchdog.stop();
-                return;
-            }
-            if (!killSent && idle.elapsed() > 60000) {
-                if (kill(child, SIGKILL) == 0) {
-                    killSent = true;
-                    window.stopSending();
-                    window.appendLine(QStringLiteral("Клиент отключён за минуту без сообщений"));
-                } else if (errno != ESRCH) {
-                    std::perror("kill");
-                }
-            }
-        });
-        watchdog.start(250);
-    }
-
-    auto onText = [&](const QString& text) {
-        if (awaitingHello) {
-            awaitingHello = false;
-            window.appendLine(text);
-            return;
+    // Все дети одновременно получают EOF. Если ребёнок остановлен или
+    // перестал отвечать, ограничиваем время штатного завершения всей группы.
+    using namespace std::chrono;
+    const auto deadline = steady_clock::now() + seconds(5);
+    while (steady_clock::now() < deadline) {
+        bool anyAlive = false;
+        for (auto& s : sessions) {
+            if (stillRunning(*s)) anyAlive = true;
         }
-        if (isHost) idle.restart();
-        window.appendLine(peer + QStringLiteral(": ") + text);
-    };
-    auto onEnd = [&](const QString& reason) {
-        window.stopSending();
-        if (!reason.isEmpty()) window.appendLine(reason);
-        if (!killSent) window.appendLine(peer + QStringLiteral(" отключился"));
-        if (!isHost) app.quit();
-    };
-
-    // Деструктор reader останавливает поток до уничтожения окна и соединения.
-    ClientReader reader(connection);
-    if (isHost) {
-        reader.setObjectName(QStringLiteral("chat-reader-1"));
-        QObject::connect(&reader, &ClientReader::received, &window,
-                         onText, Qt::QueuedConnection);
-        QObject::connect(&reader, &ClientReader::disconnected, &window,
-                         onEnd, Qt::QueuedConnection);
-        reader.start();
-    } else {
-        connection.listen(&window,
-            [&](const std::string& text) { onText(QString::fromStdString(text)); },
-            [&](const std::string& reason) { onEnd(QString::fromStdString(reason)); });
+        if (!anyAlive) return;
+        std::this_thread::sleep_for(milliseconds(25));
     }
-
-    QObject::connect(&window, &ChatWindow::sendRequested, &window,
-        [&](const QString& text) {
-            try {
-                connection.send(text.toStdString());
-                window.confirmSend(text);
-            } catch (const std::exception& e) {
-                window.appendLine(QStringLiteral("Не отправлено: ") + QString::fromUtf8(e.what()));
-            }
-        });
-
-    if (!isHost) connection.send("Клиент подключился");
-    window.show();
-    return app.exec();
+    for (auto& s : sessions) {
+        if (s->pid <= 0) continue;
+        if (kill(s->pid, SIGKILL) == -1 && errno != ESRCH) std::perror("kill");
+        pid_t status;
+        do {
+            status = waitpid(s->pid, nullptr, 0);
+        } while (status == -1 && errno == EINTR);
+        if (status == -1 && errno != ECHILD) std::perror("waitpid");
+        s->pid = -1;
+    }
 }
 
 } // namespace
 
-int main(int argc, char* argv[])
+bool stillRunning(Session& s)
+{
+    if (s.pid <= 0) return false;
+    pid_t result;
+    do {
+        result = waitpid(s.pid, nullptr, WNOHANG);
+    } while (result == -1 && errno == EINTR);
+    if (result == 0) return true;
+    if (result == -1 && errno != ECHILD) std::perror("waitpid");
+    s.pid = -1;
+    return false;
+}
+
+int main(int argc, char** argv)
 {
     if (std::signal(SIGCHLD, SIG_DFL) == SIG_ERR ||
         std::signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
@@ -118,44 +78,40 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    Sessions sessions;
+    int code = 1;
     try {
-        auto connection = openConnection();
-        pid_t child = fork();
-        if (child == -1) {
-            std::perror("fork");
-            return 1;
-        }
-        if (child == 0) {
-            try {
-                const int code = runWindow(argc, argv, child, *connection);
-                _exit(code);
-            } catch (const std::exception& e) {
-                std::fprintf(stderr, "client: %s\n", e.what());
-                _exit(1);
+        const int count = clientCount(argc, argv);
+        for (int i = 0; i < count; ++i) {
+            sessions.push_back(std::make_unique<Session>(i + 1));
+            auto& current = *sessions.back();
+            current.pid = fork();
+            if (current.pid == -1) {
+                throw std::system_error(errno, std::generic_category(), "fork");
             }
-        }
-
-        int code = 1;
-        try {
-            code = runWindow(argc, argv, child, *connection);
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "host: %s\n", e.what());
-            // При ошибке запуска ребёнок может ещё ждать готовности хоста.
-            if (child > 0 && kill(child, SIGKILL) == -1 && errno != ESRCH) {
-                std::perror("kill");
+            if (current.pid == 0) {
+                try {
+                    const QString name = current.name;
+                    auto mine = std::move(current.channel);
+                    // Закрыть в ребёнке копии ВСЕХ чужих соединений.
+                    sessions.clear();
+                    mine->selectSide(false);
+                    const int childCode = runClient(argc, argv, name, *mine);
+                    _exit(childCode);
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "client: %s\n", e.what());
+                    _exit(1);
+                }
             }
+            // Для FIFO завершаем открытие этой пары, прежде чем создавать следующую.
+            current.channel->selectSide(true);
+            current.idle.start();
         }
-        connection->close(); // Клиент получит EOF и закроет своё окно.
-        if (child > 0) {
-            while (waitpid(child, nullptr, 0) == -1) {
-                if (errno == EINTR) continue;
-                std::perror("waitpid");
-                return 1;
-            }
-        }
-        return code;
+        // Все fork() у хоста уже завершены. Теперь можно запустить Qt и потоки.
+        code = runHost(argc, argv, sessions);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "host: %s\n", e.what());
-        return 1;
     }
+    finish(sessions);
+    return code;
 }
