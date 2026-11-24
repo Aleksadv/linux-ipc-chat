@@ -8,6 +8,14 @@
 #include <QPushButton>
 #include <QVariant>
 #include <QVBoxLayout>
+#include <cerrno>
+#include <system_error>
+#include <time.h>
+
+namespace {
+constexpr int timeRole = Qt::UserRole;
+constexpr int numberRole = Qt::UserRole + 1;
+} // namespace
 
 ChatWindow::ChatWindow(int self, int clientCount, QWidget* parent)
     : QWidget(parent), self_(self), history_(new QListWidget(this)),
@@ -37,7 +45,25 @@ ChatWindow::ChatWindow(int self, int clientCount, QWidget* parent)
 
 void ChatWindow::showMessage(const chat::Message& message)
 {
-    appendLine(chat::formatMessage(message));
+    // В обычном случае новая запись идёт в конец. При задержке ищем её место.
+    int position = history_->count();
+    for (int row = position - 1; row >= 0; --row) {
+        auto* previous = history_->item(row);
+        const auto time = previous->data(timeRole);
+        if (!time.isValid()) continue; // Статус подключения или ошибка.
+        const auto previousNs = time.toLongLong();
+        if (previousNs < message.sentNs ||
+            (previousNs == message.sentNs &&
+             previous->data(numberRole).toULongLong() <= message.number)) {
+            break;
+        }
+        position = row;
+    }
+    auto* item = new QListWidgetItem(chat::formatMessage(message));
+    item->setData(timeRole, message.sentNs);
+    item->setData(numberRole, message.number);
+    history_->insertItem(position, item);
+    history_->scrollToBottom();
 }
 
 void ChatWindow::appendLine(const QString& line)
@@ -54,7 +80,15 @@ void ChatWindow::sendMessage()
         appendLine(QStringLiteral("Сообщение длиннее %1 байт UTF-8").arg(chat::maxTextBytes));
         return;
     }
-    emit sendRequested(chat::Message{self_, recipient_->currentData().toInt(), 0, text});
+    timespec now{};
+    if (::clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
+        const std::error_code error(errno, std::generic_category());
+        appendLine(QStringLiteral("Не удалось получить время отправки: ")
+                   + QString::fromStdString(error.message()));
+        return;
+    }
+    const qint64 sentNs = static_cast<qint64>(now.tv_sec) * 1'000'000'000 + now.tv_nsec;
+    emit sendRequested(chat::Message{self_, recipient_->currentData().toInt(), 0, sentNs, text});
 }
 
 void ChatWindow::clearInput()

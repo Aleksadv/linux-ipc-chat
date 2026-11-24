@@ -13,6 +13,7 @@ struct Message {
     int from;
     int to;
     quint64 number;
+    qint64 sentNs;
     QString text;
 };
 
