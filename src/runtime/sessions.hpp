@@ -25,4 +25,4 @@ using Sessions = std::vector<std::unique_ptr<Session>>;
 
 bool stillRunning(Session& session);
 int runHost(int& argc, char** argv, Sessions& sessions);
-int runClient(int& argc, char** argv, const QString& name, Connection& channel);
+int runClient(int& argc, char** argv, int self, int clientCount, Connection& channel);

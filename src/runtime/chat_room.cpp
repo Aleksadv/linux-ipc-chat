@@ -3,7 +3,6 @@
 #include "ui/chat_window.hpp"
 
 #include <QApplication>
-#include <QByteArray>
 #include <QDeadlineTimer>
 #include <QTimer>
 #include <cerrno>
@@ -15,13 +14,7 @@
 
 namespace {
 
-// Оставляем место для номера сообщения и имени отправителя в кадре pipe.
-constexpr std::size_t maxUserBytes = 4000;
-
-QString sizeError()
-{
-    return QStringLiteral("Сообщение длиннее 4000 байт UTF-8");
-}
+const QString errorPrefix = QStringLiteral("E\n");
 
 struct Pending {
     std::string text;
@@ -35,26 +28,33 @@ struct Delivery {
 
 } // namespace
 
-int runClient(int& argc, char** argv, const QString& name, Connection& channel)
+int runClient(int& argc, char** argv, int self, int clientCount, Connection& channel)
 {
     QApplication app(argc, argv);
-    ChatWindow window(name);
+    ChatWindow window(self, clientCount);
     channel.listen(&window,
-        [&](const std::string& line) { window.appendLine(QString::fromStdString(line)); },
+        [&](const std::string& bytes) {
+            const auto packet = QString::fromStdString(bytes);
+            if (packet.startsWith(errorPrefix)) {
+                window.appendLine(packet.mid(errorPrefix.size()));
+                return;
+            }
+            const auto message = chat::decodeMessage(packet);
+            if (!message || message->number == 0) {
+                window.appendLine(QStringLiteral("Некорректное сообщение хоста"));
+                return;
+            }
+            window.showMessage(*message);
+        },
         [&](const std::string& reason) {
             if (!reason.empty()) std::fprintf(stderr, "client: %s\n", reason.c_str());
             app.quit();
         });
 
     QObject::connect(&window, &ChatWindow::sendRequested, &window,
-        [&](const QString& text) {
-            const auto bytes = text.toStdString();
-            if (bytes.size() > maxUserBytes) {
-                window.appendLine(sizeError());
-                return;
-            }
+        [&](const chat::Message& message) {
             try {
-                channel.send(bytes);
+                channel.send(chat::encodeMessage(message).toStdString());
                 window.clearInput(); // Строку в историю доставит хост.
             } catch (const std::exception& e) {
                 window.appendLine(QStringLiteral("Не отправлено: ") + QString::fromUtf8(e.what()));
@@ -68,7 +68,7 @@ int runClient(int& argc, char** argv, const QString& name, Connection& channel)
 int runHost(int& argc, char** argv, Sessions& sessions)
 {
     QApplication app(argc, argv);
-    ChatWindow window(QStringLiteral("Хост"));
+    ChatWindow window(chat::host, static_cast<int>(sessions.size()));
     std::vector<Delivery> deliveries(sessions.size());
     quint64 sequence = 0;
 
@@ -107,20 +107,44 @@ int runHost(int& argc, char** argv, Sessions& sessions)
         }
     };
 
-    auto broadcast = [&](const QString& sender, const QString& text) {
-        const auto line = QStringLiteral("#%1 %2: %3").arg(++sequence).arg(sender, text);
-        const auto bytes = line.toStdString();
-        window.appendLine(line);
-        for (std::size_t i = 0; i < sessions.size(); ++i) {
-            if (!sessions[i]->online) continue;
-            auto& queue = deliveries[i].queue;
-            if (queue.size() >= 128) {
-                disconnect(i, QStringLiteral("переполнена очередь доставки"));
-                continue;
-            }
-            queue.push_back(Pending{bytes});
-            flush(i);
+    // У каждого клиента своя очередь. Индекс сессии на единицу меньше ID.
+    auto sendToClient = [&](int id, const std::string& bytes) {
+        const auto i = static_cast<std::size_t>(id - 1);
+        if (i >= sessions.size() || !sessions[i]->online) return false;
+        auto& queue = deliveries[i].queue;
+        if (queue.size() >= 128) {
+            disconnect(i, QStringLiteral("переполнена очередь доставки"));
+            return false;
         }
+        queue.push_back(Pending{bytes});
+        flush(i);
+        return sessions[i]->online;
+    };
+
+    auto route = [&](chat::Message message) {
+        message.number = ++sequence;
+        const auto bytes = chat::encodeMessage(message).toStdString();
+        if (message.to == chat::everyone) {
+            window.showMessage(message);
+            for (std::size_t i = 0; i < sessions.size(); ++i) {
+                sendToClient(static_cast<int>(i + 1), bytes);
+            }
+            return true;
+        }
+
+        // Сначала доставляем адресату. Затем одну копию получает отправитель.
+        if (message.to == chat::host) {
+            window.showMessage(message);
+        } else if (!sendToClient(message.to, bytes)) {
+            const QString reason = QStringLiteral("Не отправлено: %1 недоступен")
+                .arg(chat::participantName(message.to));
+            if (message.from == chat::host) window.appendLine(reason);
+            else sendToClient(message.from, (errorPrefix + reason).toStdString());
+            return false;
+        }
+        if (message.from == chat::host) window.showMessage(message);
+        else sendToClient(message.from, bytes);
+        return true;
     };
 
     for (std::size_t i = 0; i < sessions.size(); ++i) {
@@ -128,11 +152,11 @@ int runHost(int& argc, char** argv, Sessions& sessions)
         d.reader = std::make_unique<ClientReader>(*sessions[i]->channel);
         d.reader->setObjectName(QStringLiteral("chat-reader-%1").arg(i + 1));
         QObject::connect(d.reader.get(), &ClientReader::received, &window,
-            [&, i](const QString& message) {
+            [&, i](const QString& packet) {
                 auto& s = *sessions[i];
                 if (!s.online) return;
                 if (!s.greeted) {
-                    if (message != QStringLiteral("HELLO")) {
+                    if (packet != QStringLiteral("HELLO")) {
                         disconnect(i, QStringLiteral("ошибка первого сообщения"));
                         return;
                     }
@@ -140,12 +164,15 @@ int runHost(int& argc, char** argv, Sessions& sessions)
                     window.appendLine(s.name + QStringLiteral(" подключился"));
                     return;
                 }
-                if (message.toUtf8().size() > static_cast<qsizetype>(maxUserBytes)) {
-                    disconnect(i, sizeError());
+                const auto message = chat::decodeMessage(packet);
+                const int id = static_cast<int>(i + 1);
+                if (!message || message->from != id || message->number != 0 ||
+                    message->to == id || message->to > static_cast<int>(sessions.size())) {
+                    disconnect(i, QStringLiteral("некорректное сообщение клиента"));
                     return;
                 }
                 s.idle.restart();
-                broadcast(s.name, message);
+                route(*message);
             }, Qt::QueuedConnection);
         QObject::connect(d.reader.get(), &ClientReader::disconnected, &window,
             [&, i](const QString& reason) {
@@ -155,13 +182,8 @@ int runHost(int& argc, char** argv, Sessions& sessions)
     }
 
     QObject::connect(&window, &ChatWindow::sendRequested, &window,
-        [&](const QString& text) {
-            if (text.toUtf8().size() > static_cast<qsizetype>(maxUserBytes)) {
-                window.appendLine(sizeError());
-                return;
-            }
-            broadcast(QStringLiteral("Хост"), text);
-            window.clearInput();
+        [&](const chat::Message& message) {
+            if (route(message)) window.clearInput();
         });
 
     QTimer watchdog;

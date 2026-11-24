@@ -91,12 +91,11 @@ int main(int argc, char** argv)
             }
             if (current.pid == 0) {
                 try {
-                    const QString name = current.name;
                     auto mine = std::move(current.channel);
                     // Закрыть в ребёнке копии ВСЕХ чужих соединений.
                     sessions.clear();
                     mine->selectSide(false);
-                    const int childCode = runClient(argc, argv, name, *mine);
+                    const int childCode = runClient(argc, argv, i + 1, count, *mine);
                     _exit(childCode);
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "client: %s\n", e.what());
